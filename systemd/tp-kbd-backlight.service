@@ -1,0 +1,15 @@
+[Unit]
+Description=ThinkPad keyboard backlight idle-off daemon
+# Wait until the graphical/session DBus is up — we need org.gnome.Mutter.IdleMonitor
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/tp_kbd_backlight.py
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
