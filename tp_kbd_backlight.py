@@ -87,12 +87,13 @@ def read_max_level():
 
 def set_level(level):
     """Returns (ok, method, error)."""
+    sysfs_err = None
     try:
         with open(LED_DIR / "brightness", "w") as f:
             f.write(str(level))
         return True, "sysfs", None
-    except Exception as sysfs_err:
-        pass
+    except Exception as e:
+        sysfs_err = str(e)
 
     if shutil.which("brightnessctl"):
         try:
@@ -193,7 +194,7 @@ def run_diagnose(cycle=True):
     add(f"  brightnessctl : {shutil.which('brightnessctl') or '<not found>'}")
     if shutil.which("brightnessctl"):
         add(f"  version       : {_cmd('brightnessctl', '--version').splitlines()[0] if _cmd('brightnessctl', '--version') else ''}")
-        add(f"  info (kbd)    :")
+        add("  info (kbd)    :")
         for line in _cmd("brightnessctl", "--device=tpacpi::kbd_backlight",
                          "info").splitlines():
             add(f"    {line}")
@@ -209,7 +210,7 @@ def run_diagnose(cycle=True):
                                    "/org/gnome/Mutter/IdleMonitor/Core")
             iface = dbus.Interface(proxy, "org.gnome.Mutter.IdleMonitor")
             idle_ms = int(iface.GetIdletime())
-            add(f"  reachable   : yes")
+            add("  reachable   : yes")
             add(f"  idle_time_ms: {idle_ms}")
         except dbus.DBusException as e:
             add(f"  reachable   : NO ({e.get_dbus_name()}: {e.get_dbus_message()})")
@@ -235,7 +236,7 @@ def run_diagnose(cycle=True):
     add(f"  path : {CONFIG_PATH}")
     add(f"  exists: {CONFIG_PATH.exists()}")
     if CONFIG_PATH.exists():
-        add(f"  content:")
+        add("  content:")
         for line in _safe_read(CONFIG_PATH).splitlines():
             add(f"    {line}")
 
