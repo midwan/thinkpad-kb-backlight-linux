@@ -14,9 +14,17 @@ activity. Linux/Ubuntu companion to [ThinkPadKbBacklight for Windows](https://gi
 - ThinkPad with the `thinkpad_acpi` kernel module (almost every recent
   ThinkPad). The LED device `/sys/class/leds/tpacpi::kbd_backlight` is what
   this tool drives.
+- Membership in the `video` group (required — the daemon writes
+  `/sys/class/leds/tpacpi::kbd_backlight/brightness`, which is
+  `root:video 0664` on Ubuntu). Both the direct sysfs path and the
+  `brightnessctl` fallback depend on this.
 - Membership in the `input` group if you plan to use `IgnoreExternalDevices`
-  (needed to read `/dev/input/event*`). `sudo usermod -aG input $USER`, then
-  log out and back in.
+  (needed to read `/dev/input/event*`).
+
+```bash
+sudo usermod -aG video,input $USER
+# log out and back in (or reboot)
+```
 
 > If you run KDE / Sway / Hyprland / etc., the default GNOME Mutter path will
 > not work, but `IgnoreExternalDevices: true` uses evdev directly and has no

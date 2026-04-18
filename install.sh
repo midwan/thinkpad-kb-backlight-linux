@@ -47,14 +47,39 @@ if ! echo "$xdg_desktop" | grep -qi gnome; then
     echo "      under non-GNOME sessions."
 fi
 
-# --- sanity: input group (needed for IgnoreExternalDevices mode) ----------
+# --- sanity: video + input group membership -------------------------------
+# Writing to /sys/class/leds/tpacpi::kbd_backlight/brightness requires write
+# access to the file. On Ubuntu it is root:video 0664, and both the direct
+# sysfs path AND brightnessctl (via its own udev rule) rely on the caller
+# being in the 'video' group. Without it, every backlight change fails.
+missing_groups=()
+if ! id -nG "$USER" | tr ' ' '\n' | grep -qx video; then
+    missing_groups+=(video)
+fi
+# 'input' is only needed for the optional IgnoreExternalDevices mode (reads
+# /dev/input/event*). Flag it alongside so users fix both in one go.
 if ! id -nG "$USER" | tr ' ' '\n' | grep -qx input; then
+    missing_groups+=(input)
+fi
+if [ "${#missing_groups[@]}" -gt 0 ]; then
     echo
-    echo "NOTE: you are not in the 'input' group."
-    echo "      The default idle monitor (GNOME Mutter) works without it, but"
-    echo "      the 'IgnoreExternalDevices' option requires reading"
-    echo "      /dev/input/event* directly. To enable that option later:"
-    echo "        sudo usermod -aG input $USER    # then log out and back in"
+    echo "NOTE: you are not in these groups: ${missing_groups[*]}"
+    echo "      - 'video' is REQUIRED for the daemon to change the keyboard"
+    echo "        backlight (tpacpi::kbd_backlight is root:video 0664)."
+    echo "      - 'input' is required only if you enable IgnoreExternalDevices"
+    echo "        (the daemon reads /dev/input/event* directly)."
+    read -r -p "Add $USER to ${missing_groups[*]} now via sudo usermod? [y/N] " ans
+    case "$ans" in
+        y|Y)
+            sudo usermod -aG "$(IFS=,; echo "${missing_groups[*]}")" "$USER"
+            echo "added. You MUST log out and back in (or reboot) for the new"
+            echo "group membership to take effect before the daemon will work."
+            ;;
+        *)
+            echo "OK — add them manually then log out/in:"
+            echo "    sudo usermod -aG $(IFS=,; echo "${missing_groups[*]}") $USER"
+            ;;
+    esac
 fi
 
 # --- install binary -------------------------------------------------------
@@ -88,10 +113,6 @@ EOF
             sudo udevadm control --reload
             sudo udevadm trigger --subsystem-match=leds
             echo "installed: $UDEV_RULE"
-            if ! id -nG "$USER" | tr ' ' '\n' | grep -qx video; then
-                echo "NOTE: you are not in the 'video' group."
-                echo "      sudo usermod -aG video $USER     # then log out and back in"
-            fi
             ;;
     esac
 fi
