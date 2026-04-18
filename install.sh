@@ -13,10 +13,11 @@ UDEV_RULE="/etc/udev/rules.d/90-thinkpad-kbd-backlight.rules"
 echo "==> tp-kbd-backlight installer"
 echo
 
-# --- sanity: python + gi + dbus -------------------------------------------
+# --- sanity: python + gi + dbus + evdev -----------------------------------
 need_pkgs=()
 python3 -c "import gi" 2>/dev/null || need_pkgs+=(python3-gi)
 python3 -c "import dbus" 2>/dev/null || need_pkgs+=(python3-dbus)
+python3 -c "import evdev" 2>/dev/null || need_pkgs+=(python3-evdev)
 if ! command -v brightnessctl >/dev/null 2>&1; then
     need_pkgs+=(brightnessctl)
 fi
@@ -44,6 +45,16 @@ if ! echo "$xdg_desktop" | grep -qi gnome; then
     echo "WARN: XDG_CURRENT_DESKTOP='$xdg_desktop' — this daemon uses the GNOME"
     echo "      Mutter IdleMonitor DBus interface. It will likely fail to start"
     echo "      under non-GNOME sessions."
+fi
+
+# --- sanity: input group (needed for IgnoreExternalDevices mode) ----------
+if ! id -nG "$USER" | tr ' ' '\n' | grep -qx input; then
+    echo
+    echo "NOTE: you are not in the 'input' group."
+    echo "      The default idle monitor (GNOME Mutter) works without it, but"
+    echo "      the 'IgnoreExternalDevices' option requires reading"
+    echo "      /dev/input/event* directly. To enable that option later:"
+    echo "        sudo usermod -aG input $USER    # then log out and back in"
 fi
 
 # --- install binary -------------------------------------------------------

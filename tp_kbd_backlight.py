@@ -37,7 +37,82 @@ DEFAULT_CONFIG = {
     "OffLevel": 0,
     "Paused": False,
     "RestorePreviousLevel": True,
+    "IgnoreExternalDevices": False,
+    "InternalDeviceMarkers": None,
 }
+
+# Linux input subsystem bus types (see <linux/input.h> / include/uapi/linux/input.h).
+BUS_PCI = 0x01
+BUS_ISA = 0x10
+BUS_USB = 0x03
+BUS_I8042 = 0x11
+BUS_BLUETOOTH = 0x05
+BUS_VIRTUAL = 0x06
+BUS_HOST = 0x19
+BUS_I2C = 0x18
+
+BUS_NAMES = {
+    BUS_PCI: "PCI",
+    BUS_ISA: "ISA",
+    BUS_USB: "USB",
+    BUS_I8042: "I8042",
+    BUS_BLUETOOTH: "BLUETOOTH",
+    BUS_VIRTUAL: "VIRTUAL",
+    BUS_HOST: "HOST",
+    BUS_I2C: "I2C",
+}
+
+INTERNAL_BUSES = {BUS_I8042, BUS_I2C, BUS_HOST, BUS_ISA, BUS_PCI}
+EXTERNAL_BUSES = {BUS_USB, BUS_BLUETOOTH}
+
+# Default name-based markers for "internal" evdev devices on ThinkPads. These
+# are substring-matched against the device name, case-insensitively, and act as
+# an override on top of the bus classification (so a USB device with one of
+# these strings in its name is still treated as internal, matching the Windows
+# behaviour where a few Lenovo-branded HIDs show up on the USB bus).
+DEFAULT_INTERNAL_MARKERS = [
+    "TrackPoint",
+    "TPPS/2",
+    "AT Translated Set 2 keyboard",
+    "ThinkPad",
+    "Synaptics",
+    "Elan",
+]
+
+
+def effective_markers(cfg):
+    m = cfg.get("InternalDeviceMarkers") if cfg else None
+    return m if m else DEFAULT_INTERNAL_MARKERS
+
+
+def _evdev_has_input_caps(dev):
+    try:
+        from evdev import ecodes
+    except ImportError:
+        return False
+    try:
+        caps = dev.capabilities()
+    except Exception:
+        return False
+    return bool(caps.get(ecodes.EV_KEY)
+                or caps.get(ecodes.EV_REL)
+                or caps.get(ecodes.EV_ABS))
+
+
+def is_internal_evdev_device(dev, cfg):
+    """True iff the device should reset the idle timer in IgnoreExternal mode."""
+    name = (getattr(dev, "name", "") or "")
+    lname = name.lower()
+    for mk in effective_markers(cfg):
+        if mk and mk.lower() in lname:
+            return True
+    try:
+        bus = dev.info.bustype
+    except Exception:
+        bus = None
+    if bus in INTERNAL_BUSES:
+        return True
+    return False
 
 
 def load_config():
@@ -55,6 +130,11 @@ def load_config():
         cfg["OffLevel"] = max(0, min(2, int(cfg["OffLevel"])))
         cfg["Paused"] = bool(cfg["Paused"])
         cfg["RestorePreviousLevel"] = bool(cfg["RestorePreviousLevel"])
+        cfg["IgnoreExternalDevices"] = bool(cfg.get("IgnoreExternalDevices", False))
+        markers = cfg.get("InternalDeviceMarkers")
+        if markers is not None and not isinstance(markers, list):
+            markers = None
+        cfg["InternalDeviceMarkers"] = markers
         return cfg
     except Exception as e:
         print(f"warn: could not parse {CONFIG_PATH}: {e}; using defaults",
@@ -217,6 +297,58 @@ def run_diagnose(cycle=True):
     except ImportError as e:
         add(f"  dbus import : FAILED ({e}) — install python3-dbus")
 
+    add("\n[idle monitor mode]")
+    try:
+        _cfg_for_mode = load_config()
+    except Exception:
+        _cfg_for_mode = dict(DEFAULT_CONFIG)
+    _ignore_ext = bool(_cfg_for_mode.get("IgnoreExternalDevices", False))
+    add(f"  mode             : {'evdev (internal devices only)' if _ignore_ext else 'Mutter DBus (any input)'}")
+    add(f"  markers          : {', '.join(effective_markers(_cfg_for_mode))}")
+    add(f"  input group      : {'yes' if 'input' in _cmd('id', '-Gn').split() else 'NO (needed for evdev mode)'}")
+
+    add("\n[evdev devices]")
+    try:
+        from evdev import InputDevice, list_devices, ecodes  # noqa: F401
+    except ImportError as e:
+        add(f"  python3-evdev not installed ({e})")
+        add("  install with: sudo apt install python3-evdev")
+    else:
+        try:
+            paths = sorted(list_devices())
+        except Exception as e:
+            paths = []
+            add(f"  enumeration error: {e}")
+        if not paths:
+            add("  (no /dev/input/event* visible — check 'input' group membership)")
+        for p in paths:
+            try:
+                d = InputDevice(p)
+            except Exception as e:
+                add(f"  {p:20s} <open failed: {e}>")
+                continue
+            try:
+                bus = d.info.bustype
+                vid = d.info.vendor
+                pid = d.info.product
+                caps = d.capabilities()
+                has_keys = bool(caps.get(ecodes.EV_KEY))
+                has_rel = bool(caps.get(ecodes.EV_REL))
+                has_abs = bool(caps.get(ecodes.EV_ABS))
+                kind = []
+                if has_keys: kind.append("keys")
+                if has_rel: kind.append("rel")
+                if has_abs: kind.append("abs")
+                if not kind: kind.append("none")
+                cls = "INTERNAL" if is_internal_evdev_device(d, _cfg_for_mode) else "external"
+                bus_s = BUS_NAMES.get(bus, f"bus=0x{bus:02X}")
+                add(f"  {d.path:20s} [{bus_s:9s}] [{cls:8s}] "
+                    f"[{'/'.join(kind):11s}] "
+                    f"vid={vid:04x} pid={pid:04x} {d.name!r}")
+            finally:
+                try: d.close()
+                except Exception: pass
+
     add("\n[cycle test]")
     if cycle:
         before = read_level()
@@ -248,6 +380,14 @@ def run_diagnose(cycle=True):
 # ---------------- daemon ----------------
 
 def run_daemon():
+    cfg = load_config()
+    if cfg["IgnoreExternalDevices"]:
+        run_evdev_daemon(cfg)
+    else:
+        run_mutter_daemon(cfg)
+
+
+def run_mutter_daemon(cfg):
     try:
         import dbus
         from dbus.mainloop.glib import DBusGMainLoop
@@ -258,7 +398,6 @@ def run_daemon():
               file=sys.stderr)
         sys.exit(2)
 
-    cfg = load_config()
     DBusGMainLoop(set_as_default=True)
     bus = dbus.SessionBus()
 
@@ -373,10 +512,191 @@ def run_daemon():
             set_level(wake_level())
             arm_idle_watch()
 
-    log(f"daemon started; timeout={cfg['TimeoutSeconds']}s "
+    log(f"daemon started (mutter); timeout={cfg['TimeoutSeconds']}s "
         f"on={cfg['OnLevel']} off={cfg['OffLevel']} "
-        f"paused={cfg['Paused']} restore={cfg['RestorePreviousLevel']}")
+        f"paused={cfg['Paused']} restore={cfg['RestorePreviousLevel']} "
+        f"ignore_external=False")
     loop.run()
+
+
+def run_evdev_daemon(cfg):
+    try:
+        from evdev import InputDevice, list_devices, ecodes
+    except ImportError as e:
+        print(f"ERROR: python3-evdev not installed: {e}", file=sys.stderr)
+        print("install with: sudo apt install python3-evdev", file=sys.stderr)
+        sys.exit(2)
+
+    import select
+
+    def log(msg):
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+    state = {
+        "cfg": cfg,
+        "last_on_level": cfg["OnLevel"],
+        "off_since": None,
+        "last_activity": time.monotonic(),
+        "devices": [],
+    }
+
+    cur = read_level()
+    if cur is not None and cur >= 1:
+        state["last_on_level"] = cur
+
+    def wake_level():
+        c = state["cfg"]
+        return state["last_on_level"] if c["RestorePreviousLevel"] else c["OnLevel"]
+
+    def close_all():
+        for d in state["devices"]:
+            try:
+                d.close()
+            except Exception:
+                pass
+        state["devices"] = []
+
+    def open_internal():
+        close_all()
+        devs = []
+        try:
+            paths = sorted(list_devices())
+        except Exception as e:
+            log(f"list_devices failed: {e}")
+            return
+        for path in paths:
+            try:
+                d = InputDevice(path)
+            except PermissionError:
+                log(f"skip {path}: permission denied (add user to 'input' group)")
+                continue
+            except Exception as e:
+                log(f"skip {path}: {e}")
+                continue
+            if not _evdev_has_input_caps(d):
+                d.close()
+                continue
+            if is_internal_evdev_device(d, state["cfg"]):
+                bus_s = BUS_NAMES.get(d.info.bustype, f"0x{d.info.bustype:02X}")
+                log(f"watching [{bus_s}] {d.path}: {d.name!r}")
+                devs.append(d)
+            else:
+                d.close()
+        state["devices"] = devs
+        if not devs:
+            log("WARN: no internal input devices matched — the daemon will "
+                "never see activity. Run --diagnose and adjust "
+                "InternalDeviceMarkers in config.json.")
+
+    def on_activity():
+        state["last_activity"] = time.monotonic()
+        if state["off_since"] is not None:
+            lvl = wake_level()
+            _, method, err = set_level(lvl)
+            log(f"active -> {lvl} ({method}{', err='+err if err else ''})")
+            state["off_since"] = None
+
+    def go_idle():
+        c = state["cfg"]
+        if c["RestorePreviousLevel"]:
+            cur = read_level()
+            if cur is not None and cur >= 1:
+                state["last_on_level"] = cur
+        _, method, err = set_level(c["OffLevel"])
+        log(f"idle -> off ({method}{', err='+err if err else ''})")
+        state["off_since"] = time.monotonic()
+
+    def reload_cfg(*_):
+        log("SIGHUP: reloading config")
+        new = load_config()
+        if new["IgnoreExternalDevices"] != state["cfg"]["IgnoreExternalDevices"]:
+            log("IgnoreExternalDevices toggled — restart the service to switch "
+                "idle-monitor backend")
+        state["cfg"] = new
+        open_internal()
+        if not new["Paused"] and state["off_since"] is None:
+            set_level(wake_level())
+        state["last_activity"] = time.monotonic()
+
+    stopping = {"flag": False}
+    def shutdown(*_):
+        log("shutting down")
+        stopping["flag"] = True
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGHUP, reload_cfg)
+
+    open_internal()
+
+    if not state["cfg"]["Paused"]:
+        cur = read_level()
+        if cur is None or cur == 0:
+            set_level(wake_level())
+
+    log(f"daemon started (evdev); timeout={cfg['TimeoutSeconds']}s "
+        f"on={cfg['OnLevel']} off={cfg['OffLevel']} "
+        f"paused={cfg['Paused']} restore={cfg['RestorePreviousLevel']} "
+        f"ignore_external=True watching={len(state['devices'])}")
+
+    state["last_activity"] = time.monotonic()
+    while not stopping["flag"]:
+        c = state["cfg"]
+        if c["Paused"]:
+            # Drain any queued events so the kernel doesn't buffer forever.
+            fds = [d.fd for d in state["devices"]]
+            try:
+                r, _, _ = select.select(fds, [], [], 1.0)
+            except (InterruptedError, OSError):
+                continue
+            for d in list(state["devices"]):
+                if d.fd in r:
+                    try:
+                        for _ in d.read():
+                            pass
+                    except OSError:
+                        log(f"device gone: {d.path}")
+                        try: d.close()
+                        except Exception: pass
+                        state["devices"].remove(d)
+            continue
+
+        now = time.monotonic()
+        timeout = c["TimeoutSeconds"]
+        if state["off_since"] is None:
+            wait = max(0.1, timeout - (now - state["last_activity"]))
+        else:
+            wait = 5.0
+
+        fds = [d.fd for d in state["devices"]]
+        try:
+            r, _, _ = select.select(fds, [], [], wait)
+        except (InterruptedError, OSError):
+            continue
+
+        activity = False
+        for d in list(state["devices"]):
+            if d.fd not in r:
+                continue
+            try:
+                for ev in d.read():
+                    if ev.type == ecodes.EV_KEY and ev.value != 0:
+                        activity = True
+                    elif ev.type in (ecodes.EV_REL, ecodes.EV_ABS):
+                        activity = True
+            except OSError:
+                log(f"device gone: {d.path}")
+                try: d.close()
+                except Exception: pass
+                state["devices"].remove(d)
+
+        if activity:
+            on_activity()
+        elif state["off_since"] is None \
+                and (time.monotonic() - state["last_activity"]) >= timeout:
+            go_idle()
+
+    close_all()
 
 
 def main():
